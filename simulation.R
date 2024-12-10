@@ -1,17 +1,25 @@
-simulate_session <- function(base,alpha,beta1,beta2,pi,ndraws,nchoices,J) {
-  a <- rgamma(J, shape = alpha[1], scale = alpha[2])
-  b1 <- runif(J, min = beta1[1], max = beta1[2])
-  b2 <- runif(J, min = beta2[1], max = beta2[2])
+simulate_session <- function(base,alpha,beta1,beta2,pi,ndraws,nchoices,J,seed) {
+  set.seed(seed)
+  
+  get_params <- function(alpha,beta1,beta2,J) {
+    a <- rgamma(J, shape = alpha[1], scale = alpha[2])
+    b1 <- runif(J, min = beta1[1], max = beta1[2])
+    b2 <- runif(J, min = beta2[1], max = beta2[2])
+    return(list(a,b1,b2))
+  }
+  params <- get_params(alpha,beta1,beta2,J)
+  a <- params[[1]]
+  b1 <- params[[2]]
+  b2 <- params[[3]]
   
   # Calculate utilities
   for (j in 1:J) {
     if (j <= nchoices) {
       base[, paste0("J",j)] <- (pi * a[j] * base$party + b1[j] * base$age + 
-                                  b2[j] * base$origin + rnorm(1)/2)
-    }
+                                  b2[j] * base$origin) + rnorm(1)/2}
     else {
       base[, paste0("J",j)] <- 0
-        # leads to choice probability being zero
+        # leads to choice probability being zero for words outside the choice set
     }
   }
   

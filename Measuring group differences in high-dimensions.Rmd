@@ -1,0 +1,555 @@
+---
+title: "Appendix: Empirical exercise following Gentzkow et al. 2019"
+output:
+  pdf_document: default
+  html_document:
+    df_print: paged
+---
+
+```{r setup, include=FALSE}
+knitr::opts_knit$set(root.dir = "C:/Users/flori/OneDrive/_MSc Economics/Semester III/ML for Economics/Empirical Project")
+
+library(dplyr)
+library(tidyr)
+library(ggplot2)
+```
+
+## Display features of original data
+
+```{r}
+read.table("appendix_table_1.txt", header=FALSE, sep=" ") %>%
+  mutate(draws_per_speaker = (V6 + V7) / V4 * 20) %>%
+  rename(choice_set = V5, session = V3) %>%
+  ggplot(aes(x = session)) +
+  geom_line(aes(y = choice_set, color = "Choice set")) + 
+  geom_line(aes(y = draws_per_speaker, color = "Draws")) +
+  scale_y_continuous(
+    name = "Choice Set",
+    sec.axis = sec_axis(~ ./20, name = "Draws")
+  ) +
+  scale_color_manual(values = c("Choice set" = "blue", "Draws" = "green")) +
+  labs(color = "Legend") + 
+  ggtitle("Changes in verbosity and size of choice set in original data")
+```
+
+## Simuating the data
+To generate the sample, we first create a sample of 100 politicians with different party affiliations and origins (from 20 different regions). Note that different from the real data, these demographics stay constant over time (which does not matter a lot for the exercise):
+```{r}
+# Create 100 politicians
+base <- data.frame(id = 1:100,
+                   party = sample(c(rep(0, 50), rep(1, 50))), 
+                   age = as.integer(rnorm(100, mean = 60, sd = 10)), 
+                   origin = sample(10:20,100,replace=TRUE))
+head(base)
+```
+
+Now we use a Multinomial Logit Model to generate utilities for each choice in the choice set which depend on the speaker's characteristics. Specifically, we calculate utility from using a phrase $j$ (choosing a high $J \geq 1000$) in session $t$ as a function of party affiliation $P_i$, speaker age $A_{i}$ and origin $O_i$ (to introduce some demographic variation), and an individual error term: $$u_{jit} = \pi_t \cdot \alpha_{j,t} \cdot P_i + \beta_{1,t} \cdot A_{i} + \beta_{2,t} \cdot O_i + \epsilon_{it}$$
+Note that the parameter $\pi_t$ determines partisanship, in the sense that if $\pi_t=0$ party affiliation does not matter for choice probabilities. Without changes in $\pi_t$, the choice specific $\alpha_{j,t}$ may change over time but not the mean $\overline{\alpha}$.
+```{r}
+# Set parameters
+
+alpha <- c(1,0.5) # shapes gamma-distribution
+beta1 <- c(0.2,0.3) # shapes uniform-distribution
+beta2 <- c(0.8,1) # shapes uniform-distribution
+  # effect sizes are not scale-invariant, still in this setup origin matters more
+
+pi <- c(rep(1, 70), seq(1, 1.4, length.out = 30))
+  # partisanship increasing in last 30 session
+ndraws <- c(rep(100,25),seq(102,250,length.out=75))
+  # number of draws (speech length) increasing from session 30 onwards
+nchoices <- c(rep(1000,25),seq(1004, 1200, length.out = 50),rep(1200,25))
+  # choice set grows linearly in session 25-75
+
+J <- max(nchoices)
+```
+
+Display features of simulated data:
+```{r}
+ggplot(data.frame(nchoices = nchoices, ndraws = ndraws, 
+                  session = 1:100), aes(x = session)) +
+geom_line(aes(y = nchoices, color = "Choice set")) + 
+geom_line(aes(y = ndraws*2.5, color = "Draws")) +
+scale_y_continuous(
+  name = "Choice Set",
+  sec.axis = sec_axis(~ ./2.5, name = "Draws")
+) +
+scale_color_manual(values = c("Choice set" = "blue", "Draws" = "green")) +
+labs(color = "Legend") + 
+ggtitle("Changes in verbosity and size of choice set in simulated data")
+```
+
+With the parameters set, we can let each politician draw from their personal probability distribution over the choice set (function provided in simulation.R file). This is how choices look aggregated for the two parties in the first session:
+```{r}
+source("simulation.R")
+
+simulate_session(base,alpha,beta1,beta2,pi[100],ndraws[100],nchoices[100],J,51) %>%
+  pivot_longer(starts_with("V"),names_to="choice",values_to="total_occurences") %>%
+  ggplot(aes(x=choice,y=total_occurences,fill=factor(party))) + 
+  geom_bar(stat="identity") +
+  ggtitle("Total draws of each choice per party") + 
+  theme(axis.text.x = element_blank(), axis.ticks.x = element_blank())
+```
+
+We can see that our data is very sparse, as many choices are barely chosen by any party. Note that this is the result of single choice probabilities being low due to the many options.
+
+Now we simulate data for all years:
+```{r}
+#pb <- txtProgressBar(1,100,style=3)
+data <- simulate_session(base,alpha,beta1,beta2,pi[1],
+                                        ndraws[1],nchoices[1],J,1)
+for (t in 2:100) {
+    data <- rbind(data,simulate_session(base,alpha,beta1,beta2,pi[t],
+                                        ndraws[t],nchoices[t],J,t^3))
+    #setTxtProgressBar(pb,t)
+}
+#close(pb)
+data$session <- rep(1:100, each = 100)
+data_agg <- data %>%
+    group_by(party, session) %>%
+    summarize(across(V1:paste("V",max(nchoices),sep=""),
+                     ~ sum(.x, na.rm = TRUE)))
+```
+
+## A very naive estimator 
+As a starting point, we could try to just use the first estimator that would come to mind for measuring a difference in choice vectors. For example, we could just take the absolute mean difference between all choices for party 0 vs party 1. What happens when we estimate partisanship in such a naive way?
+```{r}
+data_long <- data_agg %>%
+    pivot_longer(
+        cols = starts_with("V"),
+        names_to = "phrase",
+        values_to = "count"
+    ) %>%
+  pivot_wider(
+    names_from = party,
+    values_from = count,
+    names_prefix = "party_"
+  )
+
+data_long$difference = abs(data_long$party_0 - data_long$party_1)
+
+data_long %>%
+  group_by(session) %>%
+  summarize(mean_difference = mean(difference,na.rm=TRUE)) %>%
+  ggplot(aes(x = session)) +
+  geom_line(aes(y = mean_difference)) + 
+  geom_vline(xintercept = 70, linetype = "dashed", color = "black") +
+  geom_smooth(aes(y = mean_difference), method = "loess", span=0.5) + 
+  theme_minimal() +
+  ggtitle("A bad estimator for partisanship (mean absolute difference)")
+```
+
+Unsurprisingly, this estimator is strongly affected by the number of draws and therefore biased. It picks up an increase in speech differences before true partisanship starts to increase (session 70).
+
+## Another naive estimator
+An additional problem with taking the absolute mean difference as a measure is that it has no real-world interpretation. For that reason, Gentzkow et al. 2019 propose as measure the probability of an outside observer guessing party affiliation correctly after hearing just one phrase. Intuitively, this measure ranges between 0.5 if there is no partisanship and 1 for complete partisanship (i.e., there is no phrase used by both parties).
+```{r}
+data_long$ndraws <- rep(ndraws*50,each=J)
+
+data_long$q0 <- data_long$party_0 / data_long$ndraws
+data_long$q1 <- data_long$party_1 / data_long$ndraws
+data_long$rho <- data_long$q1 /(data_long$q0+data_long$q1)
+                  # if phrase never used, then rho = NA
+data_long$posterior <- (0.5 * (data_long$q1*data_long$rho + 
+                                 data_long$q0*(1-data_long$rho)))
+
+biased_estimates <- (data_long %>%
+    group_by(session) %>%
+    summarize(mean_partisanship = sum(posterior,na.rm=TRUE)))$mean_partisanship
+
+data_long %>%
+  group_by(session) %>%
+  summarize(mean_partisanship = sum(posterior,na.rm=TRUE)) %>%
+  ggplot(aes(x=session,y=mean_partisanship)) + geom_line() +
+  geom_vline(xintercept = 70, linetype = "dashed", color = "black") +
+  geom_smooth(aes(y = mean_partisanship), method = "loess", span=0.5) + 
+  theme_minimal() +
+  ggtitle("Naive but interpretable partisanship measure")
+```
+
+We see two problems: partisanship is too high in general (before session 70 the theoretically true value of the measure would be 0.5) and it indicates changes where there aren't  any.
+
+## Leave-one-out estimator
+Intuitively, the high-dimensionality problem leads to the fact that a choice made by a single politicians alone strongly influences the derived choice probability for his party. Thereby, for some phrases, estimates of $P(j|R)$ and $P(R|j)$ may both stem primarily from the same observation, leading to an undesired correlation in the error for both estimates (if our estimate for the former is bad, the estimate for the latter will be bad too). Therefore, we now calculate them from two different samples: one is a single individual, the other is all the other politicians.
+```{r}
+# prepare data
+data_combined <- merge((data %>% pivot_longer(cols=starts_with("V"),
+                                      names_to="phrase",values_to="q_i")),
+      (data_long),by=c("session","phrase")) %>%
+      arrange(session,id)
+
+data_combined$ndraws <- rep(ndraws,each=J*100)
+
+# drop observation i from party phrase-counts:
+data_combined <- data_combined %>%
+  mutate(party_0_loo = party_0 - q_i * abs(party-1),
+         party_1_loo = party_1 - q_i * party)
+
+data_combined$q0 <- data_combined$party_0_loo / (data_combined$ndraws*50)
+data_combined$q1 <- data_combined$party_1_loo / (data_combined$ndraws*50)
+data_combined$rho <- (data_combined$q1+1e-15) /(data_combined$q0+
+                                                  data_combined$q1+2e-15)
+                  # if phrase never used, then rho = NA
+data_combined$posterior <- (data_combined$party * data_combined$q_i/
+                              data_combined$ndraws *data_combined$rho + 
+                              (1-data_combined$party) * data_combined$q_i/
+                              data_combined$ndraws *(1-data_combined$rho))
+
+data_combined %>%
+  group_by(session) %>%
+  summarize(mean_partisanship = sum(posterior, na.rm = TRUE) / 100) %>%
+  ggplot(aes(x = session)) +
+  geom_line(aes(y = mean_partisanship, color = "leave-one-out")) +
+  geom_smooth(aes(y = biased_estimates, color = "naive"), 
+              method = "loess", span = 0.5, se = FALSE, linetype = "dotted") +
+  geom_smooth(aes(y = mean_partisanship, color = "leave-one-out"), 
+              method = "loess", span = 0.5) +
+  geom_vline(xintercept = 70, linetype = "dashed", color = "black") +
+  scale_color_manual(values = c("naive" = "red", "leave-one-out" = "blue")) +
+  ggtitle("Leave-one-out partisanship measure") +
+  theme_minimal() +
+  labs(color = "Estimate Type")
+```
+
+## Penalized estimator
+Gentzkow et al. 2019 propose an estimator that aims to minimize the deviation between predicted word usage and actual word usage, where the objective function includes a penalty for large values of $\alpha_{jt}$. Thereby, they directly address the problem of overestimating partisan effects. The problem is the high computational intensity of the minimization problem (because we need to estimate $T \times J \times 3$ parameters $\alpha_{jt}$, $\beta_{1,jt}$, and $\beta_{2,jt}$). For that reason, we only illustrate how this approach works without using data from all periods and without deriving the optimal penalty. To further speed up computations, we use a smaller choice set, which is why one cannot directly compare the estimation results with the other estimators.
+
+```{r}
+# Create smaller simulated data
+
+ndraws_small <- c(rep(100,25),seq(102,250,length.out=75))
+nchoices_small <- c(rep(250,25),seq(251, 300, length.out = 50),rep(300,25))
+J_small <- max(nchoices_small)
+
+data_small <- simulate_session(base,alpha,beta1,beta2,pi[1],
+                                   ndraws_small[1],nchoices_small[1],J_small,1)
+for (t in 2:100) {
+    data_small <- rbind(data_small,simulate_session(base,alpha,beta1,beta2,pi[t],
+                                ndraws_small[t],nchoices_small[t],J_small,t^3))
+}
+data_small$session <- rep(1:100, each = 100)
+
+party <- as.matrix(base$party)
+age <- as.matrix(base$age)
+origin <- as.matrix(base$origin)
+
+
+# Run the penalized estimation
+
+initial_guess <- c(rep(1,J_small),rep(0.5,J_small),rep(0.5,J_small))
+  # starting point for finding the optimal alpha, beta1, and beta2 for all choices
+
+results_penalized <- data.frame(session=numeric(0),penalty=numeric(0),
+                          alpha=numeric(0),beta1=numeric(0),beta2=numeric(0))
+
+for (p in c(0,0.5,1)) {
+  for (t in c(1,25,50,75,100)) {
+    df <- data_small[data_small$"session"==t,]
+    V <- select(df, starts_with("V")) %>% as.matrix()
+    
+    objective_function <- function(par, J, ndraws, penalty) {
+      alpha <- par[1:J]
+      beta1 <- par[(J+1):(2*J)]
+      beta2 <- par[(2*J+1):(3*J)]
+      
+      # Compute choice probabilities
+      U_mat <- party %*% t(alpha) + age %*% t(beta1) + origin %*% t(beta2) + 1e-10
+      row_sum <- rowSums(U_mat)
+      U_mat <- sweep(U_mat, 1, row_sum, "/") * ndraws[t]
+      
+      # Compute differences
+      diff <- abs(U_mat - V)
+      return(sum(diff,na.rm=TRUE) + penalty * sum(abs(alpha))) 
+    }
+    
+    # Perform the optimization
+    params <- optim(par = initial_guess, fn = objective_function, J=J_small, 
+                    ndraws=ndraws_small, penalty=p,
+                    control=list(trace=0), method="L-BFGS-B",
+                    lower = c(rep(0, 3*J_small)),
+                    upper = c(rep(5)*J_small,rep(1, 2*J_small)))
+    results_penalized <- rbind(results_penalized,
+                             data.frame(session=rep(t,J_small),
+                                        alpha=params$par[1:J_small],
+                                        penalty=rep(p,J_small),
+                                        beta1=params$par[J_small+1:2*J_small],
+                                        beta2=params$par[2*J_small+1:J_small*3]))
+  }
+}
+```
+
+Because we get estimates for $\alpha$, we need to transform it into our interpretable partisanship measure.
+```{r}
+source("transform_measure.R")
+
+results_penalized %>%
+  group_by(session,penalty) %>%
+  summarize(mean_alpha = mean(alpha),
+    partisanship = mean(transform_measure(alpha,J_small)))
+```
+
+## Own approach
+We now develop our own simple approach to address the bias with a prior. The idea is to add a value $k$ to all observed choices made. Intuitively, if we observed a phrase two times from party 1 and once from party 0, we would estimate that it is twice as likely that party 1 uses that words than party 0 (very partisan phrase). By adding $k=1$, for example, we would say that it is only $3/2 = 1.5$ times more likely that party 1 uses that word relative to party 0. This shows that our approach shrinks the partisan-effect in a similar way to the ridge regression (indeed, in a Bayesian framework ridge regressions do exactly the same as our approach, namely adding a particularly distributed prior to all observations).
+
+```{r}
+df <- data_long
+results_beta <- data.frame(session=numeric(0) ,k = numeric(0), partisanship = numeric(0))
+  
+for (k in c(0,5,10,25,50,100,250)) {
+  df$q0 <- (df$party_0+k) / (df$ndraws + k*J)
+  df$q1 <- (df$party_1+k) / (df$ndraws + k*J)
+  df$rho <- df$q1 /(df$q0+df$q1)
+                    # if phrase never used, then rho = NA
+  df$posterior <- 0.5*(df$q1*df$rho + df$q0*(1-df$rho))
+                    # add 0.5 for neutral prior (?)
+  results_beta <- rbind(results_beta, data.frame(session=1:100,
+                     k = rep(k,100),
+                     partisanship = (df %>%
+                            group_by(session) %>%
+                            summarize(partisanship = sum(posterior,na.rm=TRUE))
+                            )$partisanship))
+}
+
+
+results_beta %>%
+  ggplot(aes(x=session,y=partisanship,color=factor(k))) +
+   geom_smooth(aes(y = partisanship, color = factor(k)), 
+               method = "loess", span=0.4, se=FALSE)  +
+   geom_vline(xintercept = 70, linetype = "dashed", color = "black")+
+  ggtitle("Partisanship measures with different strengths of prior beliefs")
+```
+
+As expected, a higher prior belief shrinks estimated partisanship. We now use two different cross-validation approaches to select the optimal regularization parameter $k$.
+
+### CV 1: 5-fold
+The main idea for selecting $k$ is that we do not want our estimator to change a lot when we use different training samples (similar to plug-in estimator). Therefore, we split our sample in five parts and estimate partisanship for each of these separately. 
+```{r}
+set.seed(11)
+df$fold <- sample(1:5, size = nrow(df), replace = TRUE)
+
+results_cv1 <- data.frame(k=numeric(0),fold=numeric(0),estimate=numeric(0))
+
+for (k in seq(0,500,10)) {
+  for (f in c(1,2,3,4,5)) {
+        df_cv1 <- df %>% filter(fold==f)
+        df_cv1$q0 <- (df_cv1$party_0+k) / (df_cv1$ndraws*50 + k*J)
+        df_cv1$q1 <- (df_cv1$party_1+k) / (df_cv1$ndraws*50 + k*J)
+        df_cv1$rho <- df_cv1$q1 /(df_cv1$q0+df_cv1$q1)
+                          # if phrase never used, then rho = NA
+        df_cv1$posterior <- 0.5*(df_cv1$q1*df_cv1$rho + df_cv1$q0*(1-df_cv1$rho))
+                          # add 0.5 for neutral prior (?)
+        results_cv1 <- rbind(results_cv1, data.frame(session=1:100,
+                     k = rep(k,100),
+                     fold = rep(f,100),
+                     partisanship = (df_cv1 %>%
+                            group_by(session) %>%
+                            summarize(partisanship = sum(posterior,na.rm=TRUE))
+                            )$partisanship))
+      }
+  }
+```
+
+Now we select the one with the lowest variance over the different folds.
+```{r}
+best_k_1 <- (results_cv1 %>%
+  group_by(session,k) %>%
+  summarize(coeff_var = var(partisanship)/mean(partisanship)) %>%
+  group_by(k) %>%
+  summarize(mean_var = mean(coeff_var)) %>%
+  arrange(mean_var) %>% head(1))$k
+```
+### CV 2: Simulated data
+A good estimator has the following characteristics: (1) it estimates a partisanship measure of close to 0.5 if there is no true partisanship, (2) it detects partisanship if there is one, and (3) it has a low variance.
+By comparing the performance of our estimator with different $k$ in various simulated datasets, we can pick the one that finds a good balance between these properties. However, this approach does not work well because the exact specification of our loss function is not grounded in theory and is therefore also just an arbitrary choice.
+```{r}
+# Simulate different types of data:
+
+draws_cv <- c(100,150,200,250,300)
+data_cv <- simulate_session(base,alpha,beta1,beta2,0,draws_cv[1],J,J,1)
+# First get data without partisanship:
+for (t in 2:10) {
+    data_cv <- rbind(data_cv,simulate_session(base,alpha,beta1,
+                                              beta2,0,draws_cv[1],J,J,t^2))
+}
+# Now add data with partisanship:
+for (t in 11:20) {
+    data_cv <- rbind(data_cv,simulate_session(base,alpha,beta1,
+                                              beta2,1,draws_cv[1],J,J,t^2))
+}
+# Now do the same for other ndraw values:
+for (d in 2:length(draws_cv)) {
+  for (t in 1:10) {
+    data_cv <- rbind(data_cv,simulate_session(base,alpha,beta1,
+                                              beta2,0,draws_cv[d],J,J,t^2))
+  }
+  # Now add data with partisanship:
+  for (t in 11:20) {
+      data_cv <- rbind(data_cv,simulate_session(base,alpha,beta1,
+                                                beta2,1,draws_cv[d],J,J,t^2))
+  }
+}
+data_cv$session <- rep(1:20, 100*length(draws_cv))
+data_cv$ndraws <- rep(draws_cv, each = 100*20)
+
+df_cv <- data_cv %>%
+    group_by(party, session, ndraws) %>%
+    summarize(across(V1:paste("V",max(nchoices),sep=""), 
+                     ~ sum(.x, na.rm = TRUE)),.group='drop') %>%
+    pivot_longer(
+        cols = starts_with("V"),
+        names_to = "phrase",
+        values_to = "count"
+    ) %>%
+  pivot_wider(
+    names_from = party,
+    values_from = count,
+    names_prefix = "party_" 
+  )
+
+results_cv <- data.frame(k=numeric(0),mean_estimate_0=numeric(0),
+                                      sd_estimate_0=numeric(0),
+                                      mean_estimate_1=numeric(0),
+                                      sd_estimate_1=numeric(0))
+for (lambda in seq(0,200,1)) {
+  k <- lambda
+  df_cv$q0 <- (df_cv$party_0+k) / (df_cv$ndraws*50 + k*J)
+  df_cv$q1 <- (df_cv$party_1+k) / (df_cv$ndraws*50 + k*J)
+  df_cv$rho <- df_cv$q1 /(df_cv$q0+df_cv$q1)
+  df_cv$posterior <- 0.5*(df_cv$q1*df_cv$rho + df_cv$q0*(1-df_cv$rho))
+  results_cv = rbind(results_cv,df_cv %>%
+                  group_by(session,ndraws) %>%
+                  summarize(partisanship = sum(posterior),.groups = 'drop') %>%
+                    mutate(session_group = ifelse(session <= 10, 0, 1)) %>%
+                                    # 0 = non-partisan sessions
+                  group_by(session_group) %>%
+                  summarize(mean_estimate = mean(partisanship,na.rm=TRUE),
+                            sd_estimate = sd(partisanship,na.rm=TRUE),
+                            .groups = 'drop') %>%
+                  mutate(k=lambda) %>%
+                  pivot_wider(id_cols=k,names_from=session_group,
+                              values_from=c(mean_estimate,sd_estimate)))
+}
+```
+
+Now we specify a loss function whose minimum gives us the "optimal" $k$ (using quotes because we could only claim optimality in case of a well justified loss function):
+```{r}
+w <- 0
+  # weight for punishment of variance
+v <- 1
+  # weight for relative punishment of type I or II error
+best_k_2 <- (results_cv %>%
+  mutate(loss = w*(sd_estimate_0 + sd_estimate_1) + 
+           (mean_estimate_0-0.5) - v*(mean_estimate_1-0.5)) %>%
+  arrange(loss) %>% head(1))$k
+    # the optimal k is simply the one reported in the first row.
+```
+
+
+### Corrected estimates
+```{r}
+results_beta <- data.frame(session=numeric(0) ,k = numeric(0), 
+                           partisanship = numeric(0))
+  
+for (k in c(0,best_k_1)) {
+  df$q0 <- (df$party_0+k) / (df$ndraws + k*J)
+  df$q1 <- (df$party_1+k) / (df$ndraws + k*J)
+  df$rho <- df$q1 /(df$q0+df$q1)
+                    # if phrase never used, then rho = NA
+  df$posterior <- 0.5*(df$q1*df$rho + df$q0*(1-df$rho))
+                    # add 0.5 for neutral prior (?)
+  results_beta <- rbind(results_beta, data.frame(session=1:100,
+                     k = rep(k,100),
+                     partisanship = (df %>%
+                            group_by(session) %>%
+                            summarize(partisanship = sum(posterior,na.rm=TRUE))
+                            )$partisanship))
+}
+
+
+results_beta %>%
+  ggplot(aes(x=session,y=partisanship,color=factor(k))) +
+   geom_smooth(aes(y = partisanship, color = factor(k)), 
+               method = "loess", span=0.4, se=TRUE)  +
+   geom_vline(xintercept = 70, linetype = "dashed", color = "black")+ 
+  theme_minimal() +
+  ggtitle("Partisanship estimated with optimal prior") +labs(color = "Prior k")
+```
+
+We find that our approach, although being much simpler and saving a lot of computation time, is also successful in detecting the true rise in partisanship after session 70.
+
+## Code from Simulation.R
+```{r}
+simulate_session <- function(base,alpha,beta1,beta2,pi,ndraws,nchoices,J,seed) {
+  set.seed(seed)
+  
+  get_params <- function(alpha,beta1,beta2,J) {
+    a <- rgamma(J, shape = alpha[1], scale = alpha[2])
+    b1 <- runif(J, min = beta1[1], max = beta1[2])
+    b2 <- runif(J, min = beta2[1], max = beta2[2])
+    return(list(a,b1,b2))
+  }
+  params <- get_params(alpha,beta1,beta2,J)
+  a <- params[[1]]
+  b1 <- params[[2]]
+  b2 <- params[[3]]
+  
+  # Calculate utilities
+  for (j in 1:J) {
+    if (j <= nchoices) {
+      base[, paste0("J",j)] <- (pi * a[j] * base$party + b1[j] * base$age + 
+                                  b2[j] * base$origin) + rnorm(1)/2}
+    else {
+      base[, paste0("J",j)] <- 0
+        # leads to choice probability being zero for words outside the choice set
+    }
+  }
+  
+  # Calculate choice probabilities
+  base[, paste0("J", 1:J)] <- exp(base[, paste0("J", 1:J)])
+  base$total <- rowSums(base[, paste0("J", 1:J)]) + 1
+  for (j in 1:J) {
+    base[, paste0("J",j)] <- base[, paste0("J",j)] / base$total
+  }
+  
+  J_columns <- base[, grepl("^J", colnames(base))]
+  draws_matrix <- matrix(0, nrow = 100, ncol = J)
+  
+  # Perform 100 draws for each individual (each row)
+  for (i in 1:100) {
+    # For each individual, draw 100 choices based on the probabilities in J_columns_normalized
+    draws <- sample(1:J, size = ndraws, replace = TRUE, prob = J_columns[i, ])
+    
+    # Count the number of times each choice (J*) is selected and store it in the draws_matrix
+    draws_table <- table(draws)  # counts how many times each column is chosen
+    draws_matrix[i, as.numeric(names(draws_table))] <- draws_table
+  }
+  
+  # Convert draws_matrix to a data frame to display
+  draws_matrix_df <- as.data.frame(draws_matrix)
+  output <- as.data.frame(cbind(base[c("id","party","age","origin")],draws_matrix_df))
+  for (j in 1:J) {
+    if (j > nchoices) {
+      output[, paste0("V",j)] <- NA
+      # leads to choice probability being zero
+    }
+  }
+    # set values to NA for not yet available choices
+  
+  return(output)
+}
+```
+
+## Code from transform_measure.R
+```{r}
+# turn alpha estimate into partisan measure
+
+transform_measure <- function(alpha,J){
+  try <- data.frame(u = rep(1,J),
+                    alpha = alpha)
+  try$delta <- try$u + try$alpha
+  try$prob_0 <- exp(try$u) / sum(exp(try$u))
+  try$prob_1 <- exp(try$delta) / sum(exp(try$delta))
+  try$rho <- try$prob_1 / (try$prob_0 + try$prob_1)
+  try$partisanship <- 0.5*(try$prob_1*try$rho + try$prob_0*(1-try$rho))
+  return(sum(try$partisanship))  
+}
+```
